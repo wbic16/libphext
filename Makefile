@@ -21,5 +21,7 @@ test: phextio
 	./phextio 16.7.5/12.1.3/42.17.16	
 	./phextio 16.7.5/12.1.3/42.17.17
 	./phextio 13.13.13/13.13.13/13.13.13
+perf: phextio
+	/bin/bash ./test-performance.sh
 clean:
 	rm -f *.o; rm -f phextio
