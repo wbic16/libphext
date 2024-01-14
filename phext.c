@@ -243,7 +243,7 @@ void phext_set_coordinate(phext_coordinate *coord, char *address)
 char *phext_get_address(phext_coordinate coord)
 {
    char* buffer = (char*) malloc(PHEXT_BUFFER_SIZE);
-   sprintf(buffer, "%d.%d.%d/%d.%d.%d/%d.%d.%d\0",
+   sprintf(buffer, "%d.%d.%d/%d.%d.%d/%d.%d.%d",
       coord.Z.library, coord.Z.shelf, coord.Z.series,
       coord.Y.collection, coord.Y.volume, coord.Y.book,
       coord.X.chapter, coord.X.section, coord.X.scroll);
