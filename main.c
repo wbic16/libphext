@@ -14,9 +14,9 @@ int main(int argc, char** argv)
   }
 
   char* address = phext_get_address(coord);    
-
-  #define BUFFER_LIMIT 1000000
-  char buffer[BUFFER_LIMIT];
+  
+  const int BUFFER_LIMIT = 1024*1024*1024; // 1GB = 500ms on an average SSD
+  char* buffer = (char*)malloc(BUFFER_LIMIT);
   char* filename = "sample.phext";
   if (argc >= 3)
   {
@@ -25,7 +25,10 @@ int main(int argc, char** argv)
   FILE* fp = fopen(filename, "r");
   if (fp)
   {
-    int bytes = fread(buffer, sizeof(char), BUFFER_LIMIT, fp);
+    size_t bytes = fread(buffer, sizeof(char), BUFFER_LIMIT, fp);
+    if (bytes == BUFFER_LIMIT) {
+      printf("WARNING: 1 GB limit reached - input possibly truncated.\n");
+    }
     fclose(fp);
   }
   else
