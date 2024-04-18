@@ -1,0 +1,1 @@
+tcc main.c phext.c -o phext.exe
