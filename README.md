@@ -1,6 +1,6 @@
 libphext
 --------
-libphext is a C library that provides a reference parser for fetching text nodes from phext buffers.
+libphext is a C library that provides a reference parser for fetching text nodes from phext buffers. Support for writing directly to subspace coordinates will arrive after hello-phext (a rust implementation) is completed.
 
 Files
 -----
