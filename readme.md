@@ -2,6 +2,16 @@ libphext
 --------
 libphext is a C library that provides a reference parser for fetching text nodes from phext buffers. Support for writing directly to subspace coordinates will arrive after hello-phext (a rust implementation) is completed.
 
+Version 0.4.0
+-------------
+Coordinate components are now unbounded (native `int` width). The 999 cap is gone:
+* `PHEXT_MAXIMUM_INDEX` was removed from phext.h — a breaking change for any code that referenced it.
+* Coordinate advance (`phext_*_break`) no longer saturates at 999; it fails only at INT_MAX, where incrementing would overflow.
+* `phext_validate_coordinate` is unchanged in effect: it has only ever required each component to be >= 1, and still does.
+* The address parser in `phext_set_coordinate` was widened (8 -> 16 chars per component) so full int-width components parse exactly, and `PHEXT_BUFFER_SIZE` grew 64 -> 128 so `phext_get_address` can format nine 10-digit components.
+
+Dense graphs: phext is sparse by design. Coordinate components are unbounded, but a fully-populated dense graph contains the product of its dimensions' extents in scrolls — a dense block spanning 1000 in each of 9 dimensions implies 10^27 scrolls. Materializing, exploding, or indexing such a graph costs memory proportional to its populated scroll count. The old 999 cap never protected against this (999^9 was already unreachable); sparsity does. Keep graphs sparse.
+
 Files
 -----
 * main.c: a reference parser named 'phextio' after phext.io

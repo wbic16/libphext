@@ -1,13 +1,16 @@
 #include "phext.h"
 #include <stdio.h>
+#include <limits.h>
 
 /* phext - internal module functions */
 
 /* ------------------------------------------------------------------------ */
 int advance_coordinate(int* spot)
 {
+   /* 0.4.0: no artificial cap — components advance to the native int width.
+      The only failure point is INT_MAX, where incrementing would overflow. */
    int test = *spot;
-   if (test < PHEXT_MAXIMUM_INDEX)
+   if (test < INT_MAX)
    {
       *spot = test + 1;
       return 1;
@@ -207,7 +210,7 @@ void phext_set_coordinate(phext_coordinate *coord, char *address)
    char* a = address;
    int i = 0;
    int state = 0;
-   char buffer[8];
+   char buffer[16]; /* widened from 8 in 0.4.0: a full int-width component has up to 10 digits */
    char next;
    int value;
 
@@ -219,7 +222,7 @@ void phext_set_coordinate(phext_coordinate *coord, char *address)
          buffer[i] = 0;
          value = atoi(buffer);
          set_coordinate_by_state(state, coord, value);
-         memset(buffer, 0, 8);
+         memset(buffer, 0, 16);
          i = 0;
          ++state;
          ++a;
@@ -227,7 +230,7 @@ void phext_set_coordinate(phext_coordinate *coord, char *address)
       }      
       buffer[i] = next;
       ++i;
-      if (i > 7)
+      if (i > 14)
       {
          break;
       }
@@ -236,7 +239,7 @@ void phext_set_coordinate(phext_coordinate *coord, char *address)
    buffer[i] = 0;
    value = atoi(buffer);
    set_coordinate_by_state(state, coord, value);
-   memset(buffer, 0, 8);
+   memset(buffer, 0, 16);
 }
 
 /* ------------------------------------------------------------------------ */

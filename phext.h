@@ -48,8 +48,18 @@
 #define PHEXT_COLLECTION_BREAK       '\x1d' /*  8D Break; historic: group separator         */
 #define PHEXT_SERIES_BREAK           '\x1e' /*  9D Break; historic: record separator        */
 #define PHEXT_SHELF_BREAK            '\x1f' /* 10D Break; historic: unit separator          */
-#define PHEXT_BUFFER_SIZE            64     /* large enough for truly huge phext addresses  */
+#define PHEXT_BUFFER_SIZE            128    /* large enough for truly huge phext addresses: nine 10-digit int components + separators + NUL */
 
+
+/*
+ * Dense graphs: phext is sparse by design. Coordinate components are
+ * unbounded, but a fully-populated dense graph contains the product of
+ * its dimensions' extents in scrolls — a dense block spanning 1000 in
+ * each of 9 dimensions implies 10^27 scrolls. Materializing, exploding,
+ * or indexing such a graph costs memory proportional to its populated
+ * scroll count. The old 999 cap never protected against this (999^9 was
+ * already unreachable); sparsity does. Keep graphs sparse.
+ */
 typedef struct
 {
     int library;
@@ -110,7 +120,7 @@ phext_validate_coordinate: determines if coord points to a valid phext address
 #define PHEXT_NO_ERROR 0
 #define PHEXT_INVALID_COORDINATE -1
 #define PHEXT_MINIMUM_INDEX 1
-#define PHEXT_MAXIMUM_INDEX 999 /* you really don't need more than this with 9 dimensions */
+/* 0.4.0: PHEXT_MAXIMUM_INDEX was removed (breaking change). Coordinate components are unbounded (native int width); validation only requires each component >= PHEXT_MINIMUM_INDEX. */
 int phext_validate_coordinate(phext_coordinate* coord);
 
 /*
