@@ -12,6 +12,28 @@ Coordinate components are now unbounded (native `int` width). The 999 cap is gon
 
 Dense graphs: phext is sparse by design. Coordinate components are unbounded, but a fully-populated dense graph contains the product of its dimensions' extents in scrolls — a dense block spanning 1000 in each of 9 dimensions implies 10^27 scrolls. Materializing, exploding, or indexing such a graph costs memory proportional to its populated scroll count. The old 999 cap never protected against this (999^9 was already unreachable); sparsity does. Keep graphs sparse.
 
+Development and Release
+-----------------------
+Prerequisites: gcc and make (the Makefile toolchain).
+
+Test:
+  1. Run `scripts/test.sh`
+  2. That runs exactly: `make test` -- builds phextio + phesql and runs the
+     regression fetches against the sample phexts.
+
+Build:
+  1. Run `scripts/build.sh`
+  2. That runs exactly: `make clean && make` -- a clean rebuild of phextio.
+
+Publish:
+  There is NO package registry for this library. Distribution is a git tag
+  on the GitHub repository, and the script never pushes anything itself.
+  1. Run `scripts/publish.sh` -- it runs the tests, rebuilds, prints exactly
+     what will be published (git tag `v0.4.0`), and stops.
+  2. Only when that output looks right, run `PUBLISH_CONFIRM=1 scripts/publish.sh`
+     -- that creates the LOCAL tag `v0.4.0` and prints the push command.
+  3. A human then publishes the tag by running exactly: `git push origin v0.4.0`
+
 Files
 -----
 * main.c: a reference parser named 'phextio' after phext.io
