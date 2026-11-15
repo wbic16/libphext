@@ -2,3 +2,7 @@
 .vs/*
 phextio
 *.exe
+test_phext
+test_seal
+test_fixtures
+seal_tool
