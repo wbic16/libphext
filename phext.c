@@ -1193,3 +1193,545 @@ char* phext_chain_fetch(const phext_chain* chain, const char* address)
    phext_chain_fetch_buffer(chain, address, &out);
    return (char*) out.data;
 }
+
+/* ======================================================================== */
+/* 0.6.1 additions — line/column addressing (rs src/phext.rs addressing     */
+/* section). Point, offset, and range addresses over chains. Positions are  */
+/* caret boundaries (half-open); lines split on 0x0A; columns and offsets   */
+/* count Unicode scalar values — UTF-8 is decoded code point by code point, */
+/* never counted in bytes. Resolution errors fail; nothing clamps.          */
+/* ======================================================================== */
+#include <stdint.h>
+
+/* ------------------------------------------------------------------------ */
+/* UTF-8 scalar helpers                                                     */
+/* ------------------------------------------------------------------------ */
+/* length in bytes of the scalar starting at pos (1 for an invalid lead or
+   a truncated/invalid sequence — scroll text is valid UTF-8 in practice) */
+static size_t utf8_scalar_length(const unsigned char* data, size_t length, size_t pos)
+{
+   unsigned char lead = data[pos];
+   size_t extra;
+   size_t i;
+   if (lead < 0x80) { return 1; }
+   if ((lead & 0xE0) == 0xC0)      { extra = 1; }
+   else if ((lead & 0xF0) == 0xE0) { extra = 2; }
+   else if ((lead & 0xF8) == 0xF0) { extra = 3; }
+   else { return 1; }
+   if (pos + extra >= length) { return 1; }
+   for (i = 1; i <= extra; ++i)
+   {
+      if ((data[pos + i] & 0xC0) != 0x80) { return 1; }
+   }
+   return extra + 1;
+}
+
+static size_t count_scalars(const unsigned char* data, size_t length)
+{
+   size_t count = 0;
+   size_t pos = 0;
+   while (pos < length)
+   {
+      pos += utf8_scalar_length(data, length, pos);
+      count += 1;
+   }
+   return count;
+}
+
+/* byte offset of the scalar with the given index (length when past end) */
+static size_t scalar_byte_offset(const unsigned char* data, size_t length, size_t scalar_index)
+{
+   size_t count = 0;
+   size_t pos = 0;
+   while (pos < length && count < scalar_index)
+   {
+      pos += utf8_scalar_length(data, length, pos);
+      count += 1;
+   }
+   return pos;
+}
+
+/* resolve_scroll_offset — a direct port of the reference: the scalar offset
+   of a caret position inside one scroll, or failure when the line or column
+   is past the scroll's extent (never clamps). */
+static int resolve_scroll_offset(const unsigned char* data, size_t length,
+                                 phext_scroll_position pos, size_t* offset_out)
+{
+   size_t line = 1;
+   size_t column = 1;
+   size_t offset = 0;
+   size_t byte_pos = 0;
+   if (pos.line < 1 || pos.column < 1) { return 0; }
+   while (byte_pos < length)
+   {
+      if (line == pos.line && column == pos.column) { *offset_out = offset; return 1; }
+      if (data[byte_pos] == (unsigned char) PHEXT_LINE_BREAK) { line += 1; column = 1; }
+      else { column += 1; }
+      byte_pos += utf8_scalar_length(data, length, byte_pos);
+      offset += 1;
+   }
+   if (line == pos.line && column == pos.column) { *offset_out = offset; return 1; }
+   return 0;
+}
+
+/* the scroll text at a coordinate in one member phext, in the phokenize
+   sense of presence: a coordinate is present exactly when the member's
+   phokenize enumeration contains it */
+static int addressed_scroll_text(const phext_buffer* member, phext_coordinate target, phext_buffer* out)
+{
+   phext_phoken_list list = phext_phokenize_bytes(member->data, member->length);
+   size_t i;
+   int found = 0;
+   for (i = 0; i < list.count; ++i)
+   {
+      if (coordinate_equals(list.items[i].coord, target))
+      {
+         *out = buffer_copy(list.items[i].data, list.items[i].length);
+         found = 1;
+         break;
+      }
+   }
+   phext_phoken_list_free(&list);
+   return found;
+}
+
+/* ------------------------------------------------------------------------ */
+/* parsing                                                                  */
+/* ------------------------------------------------------------------------ */
+static int parse_address_uint(const char* begin, const char* end, size_t* value_out)
+{
+   size_t value = 0;
+   const char* p;
+   if (begin == end) { return 0; }
+   for (p = begin; p < end; ++p)
+   {
+      if (*p < '0' || *p > '9') { return 0; }
+      if (value > (SIZE_MAX - (size_t) (*p - '0')) / 10) { return 0; }
+      value = value * 10 + (size_t) (*p - '0');
+   }
+   *value_out = value;
+   return 1;
+}
+
+static int parse_address_coordinate(const char* begin, const char* end, phext_coordinate* coord_out)
+{
+   int values[9];
+   const char* p = begin;
+   int i;
+   for (i = 0; i < 9; ++i)
+   {
+      const char* start = p;
+      size_t value = 0;
+      while (p < end && *p >= '0' && *p <= '9') { ++p; }
+      if (p == start) { return 0; }
+      if (!parse_address_uint(start, p, &value)) { return 0; }
+      if (value < 1 || value > (size_t) INT_MAX) { return 0; }
+      values[i] = (int) value;
+      if (i < 8)
+      {
+         char separator = (i % 3 == 2) ? '/' : '.';
+         if (p >= end || *p != separator) { return 0; }
+         ++p;
+      }
+   }
+   if (p != end) { return 0; }
+   coord_out->Z.library = values[0];
+   coord_out->Z.shelf = values[1];
+   coord_out->Z.series = values[2];
+   coord_out->Y.collection = values[3];
+   coord_out->Y.volume = values[4];
+   coord_out->Y.book = values[5];
+   coord_out->X.chapter = values[6];
+   coord_out->X.section = values[7];
+   coord_out->X.scroll = values[8];
+   return 1;
+}
+
+int phext_parse_point_address(const char* address, phext_point_address* out)
+{
+   const char* rest;
+   const char* at;
+   const char* coord_end;
+   if (address == 0 || out == 0) { return 0; }
+   memset(out, 0, sizeof(*out));
+   out->universe = 1;
+   rest = address;
+   if (rest[0] == '$')
+   {
+      const char* colon = strchr(rest, ':');
+      size_t universe = 0;
+      if (colon == 0) { return 0; }
+      if (!parse_address_uint(rest + 1, colon, &universe)) { return 0; }
+      if (universe < 1) { return 0; }
+      out->universe = universe;
+      rest = colon + 1;
+   }
+   at = strchr(rest, '@');
+   coord_end = (at != 0) ? at : rest + strlen(rest);
+   if (!parse_address_coordinate(rest, coord_end, &out->coordinate)) { return 0; }
+   if (at != 0)
+   {
+      const char* pos = at + 1;
+      const char* comma;
+      const char* col_begin;
+      const char* plus;
+      const char* col_end;
+      size_t line = 0;
+      size_t column = 0;
+      if (strchr(pos, '@') != 0) { return 0; }
+      comma = strchr(pos, ',');
+      if (comma == 0) { return 0; }
+      if (!parse_address_uint(pos, comma, &line) || line < 1) { return 0; }
+      col_begin = comma + 1;
+      plus = strchr(col_begin, '+');
+      col_end = (plus != 0) ? plus : col_begin + strlen(col_begin);
+      if (!parse_address_uint(col_begin, col_end, &column) || column < 1) { return 0; }
+      out->has_position = 1;
+      out->position.line = line;
+      out->position.column = column;
+      if (plus != 0)
+      {
+         size_t offset = 0;
+         if (!parse_address_uint(plus + 1, plus + 1 + strlen(plus + 1), &offset)) { return 0; }
+         out->has_offset = 1;
+         out->offset = offset;
+      }
+   }
+   return 1;
+}
+
+/* endpoint ordering key: a missing position sorts as the scroll's first
+   boundary in start role, its last boundary in end role */
+static void endpoint_position_key(const phext_point_address* point, int is_start,
+                                  size_t* line_out, size_t* column_out)
+{
+   if (point->has_position)
+   {
+      *line_out = point->position.line;
+      *column_out = point->position.column;
+   }
+   else if (is_start)
+   {
+      *line_out = 1;
+      *column_out = 1;
+   }
+   else
+   {
+      *line_out = SIZE_MAX;
+      *column_out = SIZE_MAX;
+   }
+}
+
+static int endpoint_compare(const phext_point_address* a, int a_is_start,
+                            const phext_point_address* b, int b_is_start)
+{
+   size_t a_line, a_column, b_line, b_column;
+   int coord;
+   if (a->universe != b->universe) { return a->universe < b->universe ? -1 : 1; }
+   coord = coordinate_compare(a->coordinate, b->coordinate);
+   if (coord != 0) { return coord; }
+   endpoint_position_key(a, a_is_start, &a_line, &a_column);
+   endpoint_position_key(b, b_is_start, &b_line, &b_column);
+   if (a_line != b_line) { return a_line < b_line ? -1 : 1; }
+   if (a_column != b_column) { return a_column < b_column ? -1 : 1; }
+   return 0;
+}
+
+int phext_parse_range_address(const char* address, phext_range_address* out)
+{
+   const char* hyphen;
+   char* first;
+   size_t first_length;
+   phext_point_address a;
+   phext_point_address b;
+   int ok;
+   if (address == 0 || out == 0) { return 0; }
+   hyphen = strchr(address, '-');
+   if (hyphen == 0) { return 0; }
+   if (strchr(hyphen + 1, '-') != 0) { return 0; }
+   first_length = (size_t) (hyphen - address);
+   first = (char*) malloc(first_length + 1);
+   if (first == 0) { return 0; }
+   memcpy(first, address, first_length);
+   first[first_length] = 0;
+   ok = phext_parse_point_address(first, &a);
+   free(first);
+   if (!ok) { return 0; }
+   if (!phext_parse_point_address(hyphen + 1, &b)) { return 0; }
+   if (a.has_offset || b.has_offset) { return 0; }
+   if (endpoint_compare(&a, 1, &b, 0) > 0)
+   {
+      out->start = b;
+      out->end = a;
+   }
+   else
+   {
+      out->start = a;
+      out->end = b;
+   }
+   return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+/* canonical serialization                                                  */
+/* ------------------------------------------------------------------------ */
+char* phext_format_point_address(const phext_point_address* point)
+{
+   char buffer[1024];
+   char* coord;
+   if (point == 0) { return (char*) buffer_copy(0, 0).data; }
+   coord = phext_get_address(point->coordinate);
+   if (point->has_position && point->has_offset)
+   {
+      if (point->universe > 1)
+      {
+         snprintf(buffer, sizeof(buffer), "$%zu:%s@%zu,%zu+%zu",
+                  point->universe, coord, point->position.line,
+                  point->position.column, point->offset);
+      }
+      else
+      {
+         snprintf(buffer, sizeof(buffer), "%s@%zu,%zu+%zu",
+                  coord, point->position.line, point->position.column, point->offset);
+      }
+   }
+   else if (point->has_position)
+   {
+      if (point->universe > 1)
+      {
+         snprintf(buffer, sizeof(buffer), "$%zu:%s@%zu,%zu",
+                  point->universe, coord, point->position.line, point->position.column);
+      }
+      else
+      {
+         snprintf(buffer, sizeof(buffer), "%s@%zu,%zu",
+                  coord, point->position.line, point->position.column);
+      }
+   }
+   else
+   {
+      if (point->universe > 1)
+      {
+         snprintf(buffer, sizeof(buffer), "$%zu:%s", point->universe, coord);
+      }
+      else
+      {
+         snprintf(buffer, sizeof(buffer), "%s", coord);
+      }
+   }
+   free(coord);
+   return (char*) buffer_copy((const unsigned char*) buffer, strlen(buffer)).data;
+}
+
+char* phext_format_range_address(const phext_range_address* range)
+{
+   char* start;
+   char* end;
+   phext_buffer result;
+   if (range == 0) { return (char*) buffer_copy(0, 0).data; }
+   start = phext_format_point_address(&range->start);
+   end = phext_format_point_address(&range->end);
+   result = buffer_copy((const unsigned char*) start, strlen(start));
+   buffer_push_byte(&result, (unsigned char) '-');
+   buffer_append(&result, (const unsigned char*) end, strlen(end));
+   free(start);
+   free(end);
+   return (char*) result.data;
+}
+
+/* ------------------------------------------------------------------------ */
+/* chain resolution + fetch                                                 */
+/* ------------------------------------------------------------------------ */
+int phext_chain_resolve_point(const phext_chain* chain, const phext_point_address* point,
+                              size_t* universe_out, phext_coordinate* coord_out, size_t* offset_out)
+{
+   phext_buffer text;
+   size_t offset = 0;
+   if (chain == 0 || point == 0) { return 0; }
+   if (point->universe < 1 || point->universe > chain->member_count) { return 0; }
+   if (!addressed_scroll_text(&chain->members[point->universe - 1], point->coordinate, &text)) { return 0; }
+   if (point->has_position)
+   {
+      if (!resolve_scroll_offset(text.data, text.length, point->position, &offset))
+      {
+         phext_buffer_free(&text);
+         return 0;
+      }
+   }
+   phext_buffer_free(&text);
+   if (universe_out != 0) { *universe_out = point->universe; }
+   if (coord_out != 0) { *coord_out = point->coordinate; }
+   if (offset_out != 0) { *offset_out = offset; }
+   return 1;
+}
+
+int phext_chain_fetch_point_buffer(const phext_chain* chain, const char* address, phext_buffer* out)
+{
+   phext_point_address point;
+   phext_buffer text;
+   size_t scalar_offset = 0;
+   size_t total;
+   size_t end_scalar;
+   size_t byte_lo;
+   size_t byte_hi;
+   if (out == 0) { return PHEXT_FAILURE; }
+   *out = buffer_copy(0, 0);
+   if (chain == 0) { return PHEXT_SUCCESS; }
+   if (!phext_parse_point_address(address, &point)) { return PHEXT_SUCCESS; }
+   if (!point.has_offset) { return PHEXT_SUCCESS; }
+   if (!phext_chain_resolve_point(chain, &point, 0, 0, &scalar_offset)) { return PHEXT_SUCCESS; }
+   if (!addressed_scroll_text(&chain->members[point.universe - 1], point.coordinate, &text)) { return PHEXT_SUCCESS; }
+   total = count_scalars(text.data, text.length);
+   end_scalar = point.offset;
+   if (end_scalar > total - scalar_offset) { end_scalar = total; }
+   else { end_scalar = scalar_offset + end_scalar; }
+   byte_lo = scalar_byte_offset(text.data, text.length, scalar_offset);
+   byte_hi = scalar_byte_offset(text.data, text.length, end_scalar);
+   phext_buffer_free(out);
+   *out = buffer_copy(text.data + byte_lo, byte_hi - byte_lo);
+   phext_buffer_free(&text);
+   return PHEXT_SUCCESS;
+}
+
+char* phext_chain_fetch_point(const phext_chain* chain, const char* address)
+{
+   phext_buffer out;
+   phext_chain_fetch_point_buffer(chain, address, &out);
+   return (char*) out.data;
+}
+
+static void range_segment_push(phext_range_segment_list* list, size_t universe,
+                               phext_coordinate coord, const unsigned char* data, size_t length)
+{
+   list->items = (phext_range_segment*) realloc(list->items, (list->count + 1) * sizeof(phext_range_segment));
+   list->items[list->count].universe = universe;
+   list->items[list->count].coord = coord;
+   list->items[list->count].text = buffer_copy(data, length);
+   list->count += 1;
+}
+
+void phext_range_segment_list_free(phext_range_segment_list* list)
+{
+   size_t i;
+   if (list == 0) { return; }
+   for (i = 0; i < list->count; ++i) { phext_buffer_free(&list->items[i].text); }
+   free(list->items);
+   list->items = 0;
+   list->count = 0;
+}
+
+int phext_chain_resolve_range(const phext_chain* chain, const phext_range_address* range,
+                              phext_range_segment_list* out)
+{
+   const phext_point_address* start;
+   const phext_point_address* end;
+   size_t universe;
+   if (out == 0) { return 0; }
+   out->items = 0;
+   out->count = 0;
+   if (chain == 0 || range == 0) { return 0; }
+   start = &range->start;
+   end = &range->end;
+   if (start->universe < 1 || end->universe > chain->member_count || start->universe > end->universe) { return 0; }
+   /* both endpoint scrolls must be present, and both endpoint positions must resolve */
+   if (!phext_chain_resolve_point(chain, start, 0, 0, 0)) { return 0; }
+   if (!phext_chain_resolve_point(chain, end, 0, 0, 0)) { return 0; }
+   for (universe = start->universe; universe <= end->universe; ++universe)
+   {
+      const phext_buffer* member = &chain->members[universe - 1];
+      phext_phoken_list scrolls = phext_phokenize_bytes(member->data, member->length);
+      size_t i;
+      if (scrolls.count > 1) { qsort(scrolls.items, scrolls.count, sizeof(phext_positioned_bytes), positioned_compare); }
+      for (i = 0; i < scrolls.count; ++i)
+      {
+         phext_positioned_bytes* ps = &scrolls.items[i];
+         size_t total;
+         size_t lo = 0;
+         size_t hi;
+         size_t byte_lo;
+         size_t byte_hi;
+         if (universe == start->universe && coordinate_compare(ps->coord, start->coordinate) < 0) { continue; }
+         if (universe == end->universe && coordinate_compare(ps->coord, end->coordinate) > 0) { continue; }
+         total = count_scalars(ps->data, ps->length);
+         hi = total;
+         if (universe == start->universe && coordinate_equals(ps->coord, start->coordinate))
+         {
+            if (start->has_position &&
+                !resolve_scroll_offset(ps->data, ps->length, start->position, &lo))
+            {
+               phext_phoken_list_free(&scrolls);
+               phext_range_segment_list_free(out);
+               return 0;
+            }
+         }
+         if (universe == end->universe && coordinate_equals(ps->coord, end->coordinate))
+         {
+            if (end->has_position &&
+                !resolve_scroll_offset(ps->data, ps->length, end->position, &hi))
+            {
+               phext_phoken_list_free(&scrolls);
+               phext_range_segment_list_free(out);
+               return 0;
+            }
+         }
+         if (lo > hi)
+         {
+            phext_phoken_list_free(&scrolls);
+            phext_range_segment_list_free(out);
+            return 0;
+         }
+         byte_lo = scalar_byte_offset(ps->data, ps->length, lo);
+         byte_hi = scalar_byte_offset(ps->data, ps->length, hi);
+         range_segment_push(out, universe, ps->coord, ps->data + byte_lo, byte_hi - byte_lo);
+      }
+      phext_phoken_list_free(&scrolls);
+   }
+   return 1;
+}
+
+int phext_chain_fetch_range_buffer(const phext_chain* chain, const char* address, phext_buffer* out)
+{
+   phext_range_address range;
+   phext_range_segment_list segments;
+   phext_chain fragment;
+   size_t universe;
+   size_t member_index = 0;
+   if (out == 0) { return PHEXT_FAILURE; }
+   *out = buffer_copy(0, 0);
+   if (chain == 0) { return PHEXT_SUCCESS; }
+   if (!phext_parse_range_address(address, &range)) { return PHEXT_SUCCESS; }
+   if (!phext_chain_resolve_range(chain, &range, &segments)) { return PHEXT_SUCCESS; }
+   fragment.members = (phext_buffer*) malloc((range.end.universe - range.start.universe + 1) * sizeof(phext_buffer));
+   fragment.member_count = range.end.universe - range.start.universe + 1;
+   fragment.closed = 0;
+   for (universe = range.start.universe; universe <= range.end.universe; ++universe)
+   {
+      char* member = (char*) buffer_copy(0, 0).data;
+      size_t i;
+      for (i = 0; i < segments.count; ++i)
+      {
+         if (segments.items[i].universe == universe && segments.items[i].text.length > 0)
+         {
+            char* next = phext_insert(member, segments.items[i].coord, (const char*) segments.items[i].text.data);
+            free(member);
+            member = next;
+         }
+      }
+      fragment.members[member_index] = buffer_copy((const unsigned char*) member, strlen(member));
+      member_index += 1;
+      free(member);
+   }
+   phext_buffer_free(out);
+   *out = phext_chain_serialize(&fragment);
+   for (universe = 0; universe < fragment.member_count; ++universe) { phext_buffer_free(&fragment.members[universe]); }
+   free(fragment.members);
+   phext_range_segment_list_free(&segments);
+   return PHEXT_SUCCESS;
+}
+
+char* phext_chain_fetch_range(const phext_chain* chain, const char* address)
+{
+   phext_buffer out;
+   phext_chain_fetch_range_buffer(chain, address, &out);
+   return (char*) out.data;
+}

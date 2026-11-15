@@ -38,11 +38,14 @@ test_seal: phext.o phext_seal.o test_seal.c
 	gcc -g phext.o phext_seal.o test_seal.c -o test_seal -llzma
 test_fixtures: phext.o test_fixtures.c
 	gcc -g phext.o test_fixtures.c -o test_fixtures
+test_range_fixtures: phext.o test_range_fixtures.c
+	gcc -g phext.o test_range_fixtures.c -o test_range_fixtures
 seal_tool: phext.o phext_seal.o seal_tool.c
 	gcc -g phext.o phext_seal.o seal_tool.c -o seal_tool -llzma
-test060: test_phext test_seal test_fixtures
+test060: test_phext test_seal test_fixtures test_range_fixtures
 	./test_phext
 	./test_seal
 	./test_fixtures tests/fixtures/chains
+	./test_range_fixtures tests/fixtures/ranges
 clean:
-	rm -f *.o; rm -f phextio; rm -f phesql.o*; rm -f phesql; rm -f test_phext test_seal test_fixtures seal_tool
+	rm -f *.o; rm -f phextio; rm -f phesql.o*; rm -f phesql; rm -f test_phext test_seal test_fixtures test_range_fixtures seal_tool
