@@ -6,7 +6,7 @@
 # push command for a human to run.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="0.6.0"
+VERSION="0.6.1"
 echo "== libphext (C) publish: version ${VERSION} =="
 echo "-- step 1/2: tests"
 "$(dirname "$0")/test.sh"

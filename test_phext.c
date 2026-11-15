@@ -1,5 +1,5 @@
 /*
- * test_phext: 0.6.0 unit tests for the C port — the rs test suites for
+ * test_phext: unit tests for the C port (0.6.0 suites, plus 0.6.1 addressing) — the rs test suites for
  * binary scrolls (src/test_binary.rs) and chains (src/test_chain.rs)
  * ported to C, plus core fetch/insert/replace checks against the
  * reference get_subspace_coordinates semantics.
@@ -445,6 +445,98 @@ static void test_multiverse(void)
    phext_chain_list_free(&chains);
 }
 
+/* ------------------------------------------------------------------ */
+/* 0.6.1 line/column addressing                                        */
+/* ------------------------------------------------------------------ */
+static void test_addressing(void)
+{
+   phext_point_address point;
+   phext_range_address range;
+   char* canonical;
+
+   /* parse + canonical form: $1: dropped, leading zeros normalized */
+   CHECK(phext_parse_point_address("$1:1.1.1/1.1.1/1.1.1@024,005", &point) == 1);
+   canonical = phext_format_point_address(&point);
+   CHECK_STR(canonical, "1.1.1/1.1.1/1.1.1@24,5");
+   free(canonical);
+   CHECK(phext_parse_point_address("$3:1.1.1/1.1.1/1.1.2@1,1+7", &point) == 1);
+   CHECK(point.universe == 3 && point.has_position && point.has_offset && point.offset == 7);
+   canonical = phext_format_point_address(&point);
+   CHECK_STR(canonical, "$3:1.1.1/1.1.1/1.1.2@1,1+7");
+   free(canonical);
+   /* rejections */
+   CHECK(phext_parse_point_address("$0:1.1.1/1.1.1/1.1.1@1,1", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.1@0,1", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.1@1,0", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/0.1.1@1,1", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.1@1", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.1@1,1+", &point) == 0);
+   CHECK(phext_parse_point_address("1.1.1/1.1.1@1,1", &point) == 0);
+
+   /* range parse: reversed input normalizes, offset endpoints rejected */
+   CHECK(phext_parse_range_address("1.1.1/1.1.1/1.1.1@24,9-1.1.1/1.1.1/1.1.1@24,5", &range) == 1);
+   canonical = phext_format_range_address(&range);
+   CHECK_STR(canonical, "1.1.1/1.1.1/1.1.1@24,5-1.1.1/1.1.1/1.1.1@24,9");
+   free(canonical);
+   CHECK(phext_parse_range_address("1.1.1/1.1.1/1.1.1@1,1+3-1.1.1/1.1.1/1.1.1@1,5", &range) == 0);
+   CHECK(phext_parse_range_address("1.1.1/1.1.1/1.1.1@1,1", &range) == 0);
+
+   /* resolution + fetch over a chain; the second scroll holds multi-byte
+      text so scalar (not byte) counting is exercised */
+   const char* stream = "alpha bravo\ncharlie\x17" "h\xc3\xa9llo\nend\x02" "second universe";
+   phext_chain_list chains = phext_parse_chains((const unsigned char*) stream, strlen(stream));
+   CHECK(chains.count == 1);
+   const phext_chain* chain = &chains.chains[0];
+
+   size_t universe = 0;
+   size_t offset = 0;
+   phext_coordinate coord;
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.2@1,3", &point) == 1);
+   CHECK(phext_chain_resolve_point(chain, &point, &universe, &coord, &offset) == 1);
+   CHECK(universe == 1 && offset == 2);
+   /* column past line length + 1 fails — never clamps */
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.1@1,13", &point) == 1);
+   CHECK(phext_chain_resolve_point(chain, &point, &universe, &coord, &offset) == 0);
+   /* missing scroll / universe fail */
+   CHECK(phext_parse_point_address("1.1.1/1.1.1/1.1.9@1,1", &point) == 1);
+   CHECK(phext_chain_resolve_point(chain, &point, &universe, &coord, &offset) == 0);
+   CHECK(phext_parse_point_address("$3:1.1.1/1.1.1/1.1.1@1,1", &point) == 1);
+   CHECK(phext_chain_resolve_point(chain, &point, &universe, &coord, &offset) == 0);
+
+   char* fetched;
+   /* offset form: scalars over multi-byte text, clipped at scroll end */
+   fetched = phext_chain_fetch_point(chain, "1.1.1/1.1.1/1.1.2@1,1+5");
+   CHECK_STR(fetched, "h\xc3\xa9llo");
+   free(fetched);
+   fetched = phext_chain_fetch_point(chain, "1.1.1/1.1.1/1.1.2@2,1+100");
+   CHECK_STR(fetched, "end");
+   free(fetched);
+   /* a bare point is a caret: fetches "" */
+   fetched = phext_chain_fetch_point(chain, "1.1.1/1.1.1/1.1.1@1,1");
+   CHECK_STR(fetched, "");
+   free(fetched);
+
+   /* range fetch: within scroll, cross-scroll, cross-universe */
+   fetched = phext_chain_fetch_range(chain, "1.1.1/1.1.1/1.1.1@1,1-1.1.1/1.1.1/1.1.1@1,6");
+   CHECK_STR(fetched, "alpha");
+   free(fetched);
+   fetched = phext_chain_fetch_range(chain, "1.1.1/1.1.1/1.1.1@2,1-1.1.1/1.1.1/1.1.2@1,2");
+   CHECK_STR(fetched, "charlie\x17" "h");
+   free(fetched);
+   fetched = phext_chain_fetch_range(chain, "1.1.1/1.1.1/1.1.2@2,1-$2:1.1.1/1.1.1/1.1.1@1,7");
+   CHECK_STR(fetched, "\x17" "end" "\x02" "second");
+   free(fetched);
+   /* empty range fetches ""; out-of-range endpoint fetches "" */
+   fetched = phext_chain_fetch_range(chain, "1.1.1/1.1.1/1.1.1@1,3-1.1.1/1.1.1/1.1.1@1,3");
+   CHECK_STR(fetched, "");
+   free(fetched);
+   fetched = phext_chain_fetch_range(chain, "1.1.1/1.1.1/1.1.1@1,1-1.1.1/1.1.1/1.1.1@9,1");
+   CHECK_STR(fetched, "");
+   free(fetched);
+
+   phext_chain_list_free(&chains);
+}
+
 int main(void)
 {
    test_core();
@@ -457,6 +549,7 @@ int main(void)
    test_phokenize_bytes_matches();
    test_chains();
    test_multiverse();
+   test_addressing();
 
    printf("test_phext: %d checks, %d failures\n", checks, failures);
    return failures == 0 ? 0 : 1;

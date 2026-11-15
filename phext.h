@@ -19,8 +19,8 @@
 
 #define PHEXT_VERSION_MAJOR          0
 #define PHEXT_VERSION_MINOR          6
-#define PHEXT_VERSION_PATCH          0
-#define PHEXT_VERSION                "0.6.0" /* 0.6.0: renumbered to match libphext-rs parity; the 1.0.x line ends (tags v1.0.0/v1.0.1 remain as history) */
+#define PHEXT_VERSION_PATCH          1
+#define PHEXT_VERSION                "0.6.1" /* 0.6.1: line/column addressing (point, offset, and range addresses); 0.6.0 renumbered to match libphext-rs parity; the 1.0.x line ends (tags v1.0.0/v1.0.1 remain as history) */
 
 #define PHEXT_LIBRARY_BREAK          '\x01' /* 11th dimension: historic: start of heading   */
 #define PHEXT_CHAIN_BREAK            '\x02' /* stream level (0.6.0): separates whole phexts within a chain */
@@ -327,3 +327,129 @@ phext_chain_fetch_buffer is the length-aware form.
 */
 char* phext_chain_fetch(const phext_chain* chain, const char* address);
 int phext_chain_fetch_buffer(const phext_chain* chain, const char* address, phext_buffer* out);
+
+/* --- line/column addressing (rs src/phext.rs, 0.6.1) --- */
+
+/*
+phext_scroll_position: a caret boundary inside one scroll — 1-based
+line and column. Column 1 is the boundary before the line's first
+character; a line of n characters has valid columns 1..n+1. Lines split
+on 0x0A; columns count Unicode scalar values, never bytes.
+*/
+typedef struct
+{
+   size_t line;
+   size_t column;
+} phext_scroll_position;
+
+/*
+phext_point_address: one parsed point address,
+"[$N:]<9D coordinate>[@<line>,<column>[+<offsetChars>]]". universe is
+1-based (1 when the "$N:" prefix is absent). has_position / has_offset
+mark the optional parts; offset is a forward selection in Unicode
+scalar values, counted within the scroll and clipped at its end.
+*/
+typedef struct
+{
+   size_t universe;
+   phext_coordinate coordinate;
+   int has_position;
+   phext_scroll_position position;
+   int has_offset;
+   size_t offset;
+} phext_point_address;
+
+/*
+phext_range_address: a parsed range — two point endpoints joined by
+one hyphen, normalized at parse time to ascending (universe,
+coordinate, line, column) order; direction is discarded. An endpoint
+without a position names its whole scroll (as start: its first
+boundary; as end: its last). Range endpoints never carry an offset.
+*/
+typedef struct
+{
+   phext_point_address start;
+   phext_point_address end;
+} phext_range_address;
+
+/*
+phext_parse_point_address / phext_parse_range_address: parse the 0.6.1
+address forms. Return 1 and fill *out on success; 0 on any malformed
+input (universe 0, a coordinate component / line / column below 1, a
+sign anywhere, an offset on a range endpoint, or trailing structure).
+"$1:" is accepted on input.
+*/
+int phext_parse_point_address(const char* address, phext_point_address* out);
+int phext_parse_range_address(const char* address, phext_range_address* out);
+
+/*
+phext_format_point_address / phext_format_range_address: the canonical
+serialization — "$1:" never written, integers in minimal decimal form,
+range endpoints ascending. Return malloc'd NUL-terminated strings.
+*/
+char* phext_format_point_address(const phext_point_address* point);
+char* phext_format_range_address(const phext_range_address* range);
+
+/*
+phext_chain_resolve_point: resolves a point address against a chain —
+(universe, coordinate, character offset within the scroll), the offset
+counting Unicode scalar values. A point without a position resolves to
+offset 0 of its scroll. Returns 1 on success; 0 when the universe or
+scroll is absent or the position is out of range — resolution errors,
+never clamps. Any out pointer may be NULL.
+*/
+int phext_chain_resolve_point(const phext_chain* chain, const phext_point_address* point,
+                              size_t* universe_out, phext_coordinate* coord_out, size_t* offset_out);
+
+/*
+phext_chain_fetch_point: fetches a point address string. A bare point
+is a caret and fetches ""; the offset form fetches the selected
+characters (scalars) from the point, terminating at the scroll
+boundary. Any parse or resolution failure fetches "". Returns a
+malloc'd NUL-terminated string; phext_chain_fetch_point_buffer is the
+length-aware form (PHEXT_SUCCESS, with "" in *out on any failure).
+*/
+char* phext_chain_fetch_point(const phext_chain* chain, const char* address);
+int phext_chain_fetch_point_buffer(const phext_chain* chain, const char* address, phext_buffer* out);
+
+/*
+phext_range_segment: one covered scroll's segment of a resolved range
+— (universe, coordinate, segment text). Segments are returned in
+ascending (universe, coordinate) order; endpoint scrolls contribute
+partial segments, scrolls strictly between contribute whole segments.
+*/
+typedef struct
+{
+   size_t universe;
+   phext_coordinate coord;
+   phext_buffer text;
+} phext_range_segment;
+typedef struct
+{
+   phext_range_segment* items;
+   size_t count;
+} phext_range_segment_list;
+void phext_range_segment_list_free(phext_range_segment_list* list);
+
+/*
+phext_chain_resolve_range: resolves a range against a chain into its
+per-scroll segments. Returns 1 and fills *out on success; 0 when either
+endpoint fails to resolve — an out-of-range endpoint is an error,
+never a clamp.
+*/
+int phext_chain_resolve_range(const phext_chain* chain, const phext_range_address* range,
+                              phext_range_segment_list* out);
+
+/*
+phext_chain_fetch_range: fetches a range address string — the spanned
+text with phext structure bytes preserved, as a phext (chain)
+fragment: each covered universe's non-empty segments are inserted at
+their coordinates into an empty phext (ascending order), universes are
+joined by PHEXT_CHAIN_BREAK, and there is NO trailing
+PHEXT_CHAIN_CLOSE. Empty segments contribute nothing; an empty range
+and any parse or resolution failure fetch "". Returns a malloc'd
+NUL-terminated string; phext_chain_fetch_range_buffer is the
+length-aware form (PHEXT_SUCCESS, with "" in *out on any failure).
+*/
+char* phext_chain_fetch_range(const phext_chain* chain, const char* address);
+int phext_chain_fetch_range_buffer(const phext_chain* chain, const char* address, phext_buffer* out);
